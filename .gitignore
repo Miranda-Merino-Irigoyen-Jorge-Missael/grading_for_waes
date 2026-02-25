@@ -1,0 +1,32 @@
+# Entorno virtual
+venv/
+env/
+
+# Variables de entorno y secretos
+.env
+config/service_account.json
+
+# Archivos generados y temporales
+output/
+logs/
+debug_output/
+temp_processing/
+__pycache__/
+*.pyc
+
+# Archivos del sistema
+.DS_Store
+
+# Secretos de OAuth
+config/token.json
+config/client_secret_*.json
+
+# Ignorar todos los archivos de Word
+*.docx
+*.json
+*.pdf
+*.txt
+fundamentos/*
+!requirements.txt
+ 
+
