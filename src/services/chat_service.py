@@ -1,4 +1,5 @@
 import logging
+import concurrent.futures
 from vertexai.generative_models import Part
 from src.config import Config
 from src.core.google_client import google_manager
@@ -159,17 +160,25 @@ class ChatService:
     )
     def _send_message_with_timeout(self, content):
         """
-        Envía mensaje utilizando la API nativa sin streaming.
-        Delega el control del socket directamente a la librería de Google.
+        Envía mensaje utilizando un Hilo con Timeout Estricto para evitar que
+        Vertex AI se quede pasmado infinitamente si se corta el internet.
         """
         try:
-            logger.info("📤 Enviando payload a Vertex AI (esperando respuesta completa en bloque)...")
+            logger.info(f"📤 Enviando payload a Vertex AI (Timeout estricto: {Config.API_TIMEOUT_SECONDS}s)...")
             
-            # API nativa: stream=False (Eliminamos request_options que daba error)
-            response = self.model.generate_content(
-                content,
-                stream=False
-            )
+            # Función interna que hará la llamada real
+            def _hacer_peticion():
+                return self.model.generate_content(content, stream=False)
+
+            # Ejecutamos la petición en un hilo aislado para poder matarla si se cuelga
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_hacer_peticion)
+                try:
+                    # Esperamos la respuesta máximo los segundos configurados en config.py
+                    response = future.result(timeout=Config.API_TIMEOUT_SECONDS)
+                except concurrent.futures.TimeoutError:
+                    # Forzamos un TimeoutError de Python que 'tenacity' sabe atrapar
+                    raise TimeoutError(f"Vertex AI no respondió en {Config.API_TIMEOUT_SECONDS}s por corte de red.")
 
             if not response or not response.text:
                 finish_reason = getattr(response.candidates[0], 'finish_reason', 'UNKNOWN') if response and hasattr(response, 'candidates') and response.candidates else 'NO_CANDIDATES'
@@ -179,7 +188,7 @@ class ChatService:
             return response
 
         except Exception as e:
-            logger.error(f"❌ Error en la comunicación nativa con Vertex AI: {e}")
+            logger.error(f"❌ Error en la comunicación con Vertex AI: {e}")
             raise
 
 # Instancia global

@@ -139,11 +139,12 @@ class GradingProcess:
             logger.error(f"Error procesando caso {client_name}: {e}")
             try:
                 sheets_service.update_status(row_idx, f"ERROR: {str(e)[:50]}")
-            except:
-                logger.error(f"No se pudo actualizar status de error para fila {row_idx}")
+            except Exception as sheet_err:
+                logger.error(f"Red tan inestable que no se pudo actualizar status de error para fila {row_idx}: {sheet_err}")
         finally:
             # Limpieza - Solo borrar PDFs temporales del paciente
-            shutil.rmtree(temp_dir)
+            # NUEVO: ignore_errors=True evita que un fallo al borrar detenga el programa entero
+            shutil.rmtree(temp_dir, ignore_errors=True)
             # NOTA: El archivo .md local NO se borra, es respaldo permanente
 
 # Instancia global

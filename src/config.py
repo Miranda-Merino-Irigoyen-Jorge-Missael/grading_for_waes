@@ -46,10 +46,10 @@ class Config:
     SCOPES = SERVICE_ACCOUNT_SCOPES
 
     # 6. Configuración de Timeouts y Reintentos para IA
-    # 🚨 REDUCIDO: 480 segundos (8 minutos) es más que suficiente para un mega-prompt.
-    API_TIMEOUT_SECONDS = 480 
+
+    API_TIMEOUT_SECONDS = 250
     
-    # 🚨 REDUCIDO: Bajamos de 7 a 2 reintentos para no quedarnos pasmados horas
+
     MAX_RETRIES = 2           
     RETRY_MIN_WAIT = 5        
     RETRY_MAX_WAIT = 30       
