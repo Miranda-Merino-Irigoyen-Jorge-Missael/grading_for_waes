@@ -2,6 +2,7 @@ google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
 google-cloud-aiplatform>=1.38.0
+google-generativeai
 gspread
 python-docx
 tenacity
