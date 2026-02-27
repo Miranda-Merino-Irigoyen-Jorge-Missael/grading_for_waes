@@ -75,7 +75,7 @@ class ChatService:
                     logger.info("Modelo Vertex inicializado con Context Caching.")
                 else:
                     self.model = GenerativeModel(
-                        "gemini-2.5-flash",
+                        "gemini-3-flash-preview",
                         system_instruction=system_instr
                     )
                     logger.info("Modelo Vertex inicializado SIN caché.")
@@ -93,7 +93,7 @@ class ChatService:
                     logger.info("Modelo Gemini API inicializado con Context Caching.")
                 else:
                     self.model = genai.GenerativeModel(
-                        model_name="gemini-2.5-flash",
+                        model_name="gemini-3-flash-preview",
                         system_instruction=system_instr
                     )
                     logger.info("Modelo Gemini API inicializado SIN caché.")
@@ -239,7 +239,7 @@ class ChatService:
                     "output": output_tokens
                 }
                 
-                return final_markdown, token_counts, "gemini-2.5-flash"
+                return final_markdown, token_counts, "gemini-3-flash-preview"
 
             except concurrent.futures.TimeoutError:
                 logger.error(f"⏰ ¡TIMEOUT! El stream excedió los {timeout_val}s.")
