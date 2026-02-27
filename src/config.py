@@ -7,7 +7,7 @@ class Config:
     Configuración centralizada para Grading VAWA.
     Soporta conexión vía Vertex AI o Gemini API Key directa.
     """
-    APP_VERSION = "v1.3" # Actualizamos versión para control
+    APP_VERSION = "v1.4" # Versión actualizada para reflejar el aumento de timeouts y tokens
 
     # 1. Definición de Rutas Base
     BASE_DIR = Path(__file__).resolve().parent.parent
@@ -50,14 +50,14 @@ class Config:
     SCOPES = SERVICE_ACCOUNT_SCOPES
 
     # 6. Configuración de Timeouts y Reintentos para IA
-    API_TIMEOUT_SECONDS = 250
+    API_TIMEOUT_SECONDS = 300
     MAX_RETRIES = 2           
     RETRY_MIN_WAIT = 5        
-    RETRY_MAX_WAIT = 30       
+    RETRY_MAX_WAIT = 60 # Aumentado también el tiempo máximo de espera entre reintentos      
 
     # 7. URLs de Documentación y Prompts
-    URL_SYSTEM_INSTRUCTIONS = "https://docs.google.com/document/d/1QsCOdhuV0N-gbujvloZFBKmMKlPRpHc4LNRY8qCMb18/edit?usp=sharing"
-    URL_PROMPT_WAES = "https://docs.google.com/document/d/1pK9tyWMvLWJiIwWKGI_L04f7Me-LPvCttaMiF1-lmlQ/edit?usp=sharing"
+    URL_SYSTEM_INSTRUCTIONS = "https://docs.google.com/document/d/10A2RkozCS_HGl5L9b0YZO_NlLy_gA4Ou698XmH1Rzlc/edit?usp=sharing"
+    URL_PROMPT_WAES = "https://docs.google.com/document/d/1kRdIgBTcZwEesJnEwvgz7GzVhEYe7jRj3Mod8QWAtTw/edit?usp=sharing"
 
     @classmethod
     def validate(cls):

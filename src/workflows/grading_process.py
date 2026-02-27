@@ -93,8 +93,18 @@ class GradingProcess:
                 raise ValueError("No se pudieron descargar documentos válidos para el cliente.")
 
             # C. Ejecutar Chat de Grading
-            logger.info("Iniciando auditoría con IA para WAEs...")
+            logger.info("Iniciando auditoría con IA para WAEs. Esto puede tardar varios minutos debido a la longitud esperada...")
             final_markdown, tokens, model_name = chat_service.execute_grading_flow(patient_pdfs)
+
+            # --- NUEVO: MONITOR DE TOKENS EN CONSOLA ---
+            logger.info("="*50)
+            logger.info(f"📊 REPORTE DE TOKENS -> Entrada: {tokens['input']} | SALIDA: {tokens['output']}")
+            if tokens['output'] < 1500:
+                logger.warning("⚠️ ALERTA: La IA generó menos de 1500 tokens. Sigue siendo una respuesta corta.")
+            else:
+                logger.info(f"✅ EXCELENTE: La IA generó una respuesta extensa de {tokens['output']} tokens.")
+            logger.info("="*50)
+            # ------------------------------------------
 
             # D. GUARDAR RESULTADO LOCALMENTE PRIMERO (RESPALDO PERMANENTE)
             # Crear directorio organizado por fecha
@@ -143,7 +153,6 @@ class GradingProcess:
                 logger.error(f"Red tan inestable que no se pudo actualizar status de error para fila {row_idx}: {sheet_err}")
         finally:
             # Limpieza - Solo borrar PDFs temporales del paciente
-            # NUEVO: ignore_errors=True evita que un fallo al borrar detenga el programa entero
             shutil.rmtree(temp_dir, ignore_errors=True)
             # NOTA: El archivo .md local NO se borra, es respaldo permanente
 
