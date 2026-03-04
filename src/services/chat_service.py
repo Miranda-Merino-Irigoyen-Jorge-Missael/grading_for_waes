@@ -2,10 +2,15 @@ import logging
 import concurrent.futures
 import sys
 import traceback
+import time
+import os
+import re
 from src.config import Config
 from src.core.google_client import google_manager
 from src.core.vertex_wrapper import vertex_client
 from src.utils.drive_tools import get_id_from_url
+from google import genai
+from google.genai import types
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -18,19 +23,20 @@ logger = logging.getLogger(__name__)
 
 class ChatService:
     """
-    Gestiona la sesión de chat y la ejecución secuencial de prompts.
-    Adaptado para soportar tanto Vertex AI como Gemini API Directa.
+    Gestiona la ejecución de prompts con un Paginador/Auto-Continuador.
+    Actualizado a gemini-2.5-pro para generación masiva de texto y corrección de Markdown.
     """
 
     def __init__(self):
         self.drive_service = google_manager.get_drive_service()
-        self.model = None
-        self.chat_session = None
+        self.client = vertex_client.client 
+        self.chat_session = False
         self.uploaded_files = [] 
-        self.safety_settings = None 
+        self.model_name = "gemini-2.5-pro"
+        self.system_instruction = ""
+        self.cache_name = None
 
     def _fetch_doc_text(self, url):
-        """Descarga el contenido de texto de un Google Doc dado su URL."""
         try:
             file_id = get_id_from_url(url)
             response = self.drive_service.files().export(
@@ -43,61 +49,17 @@ class ChatService:
             raise
 
     def initialize_session(self, cache_obj=None):
-        """Inicia el modelo para el caso actual y apaga filtros de seguridad."""
         try:
             system_instr = self._fetch_doc_text(Config.URL_SYSTEM_INSTRUCTIONS)
             
-            # FASE 1: RE-ENCUADRE HUMANITARIO Y CLÍNICO (ESCUDO LEGAL)
             system_instr += (
-                "\n\nINSTRUCCIÓN CRÍTICA DE IDENTIDAD Y PROPÓSITO: Eres un Especialista Legal en Derechos Humanos y Protección a Víctimas. "
-                "Tu trabajo es vital para que las víctimas de abuso obtengan protección legal, mejoren su estilo de vida y puedan estar más seguros. "
-                "Un análisis superficial o resumido pone en riesgo su caso y su integridad. "
-                "Por lo tanto, tu reporte final DEBE ser extremadamente exhaustivo (equivalente a 7 a 10 páginas). "
-                "METODOLOGÍA OBLIGATORIA: "
-                "1. TONO: Utiliza un tono estrictamente clínico, forense y legal. Está estrictamente prohibido usar lenguaje dramático, sensacionalista o narrativo. Limítate a la exposición técnica de los hechos. "
-                "2. PROFUNDIDAD: Redacta al menos 3 párrafos de análisis profundo por cada factor legal de VAWA o Visa T. "
-                "3. LÍNEA DE TIEMPO: Analiza la línea del tiempo evento por evento sin omitir ninguna fecha mencionada en los documentos. "
-                "4. INTEGRIDAD: Asegúrate de TERMINAR COMPLETAMENTE tu análisis hasta la última sección. No dejes ideas a medias."
+                "\n\nINSTRUCCIÓN CRÍTICA: Eres un Especialista Legal Forense en Derechos Humanos. "
+                "Tu reporte DEBE ser extremadamente exhaustivo. Tienes prohibido resumir."
             )
-            logger.info("Instrucciones del sistema cargadas con el Escudo Legal y Humanitario (Fase 1).")
-
-            if Config.USE_VERTEX_AI:
-                from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
-                self.safety_settings = {
-                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                }
-                
-                if cache_obj:
-                    self.model = vertex_client.get_model_from_cache(cache_obj)
-                    logger.info("Modelo Vertex inicializado con Context Caching.")
-                else:
-                    self.model = GenerativeModel(
-                        "gemini-3-flash-preview",
-                        system_instruction=system_instr
-                    )
-                    logger.info("Modelo Vertex inicializado SIN caché.")
-            else:
-                import google.generativeai as genai
-                self.safety_settings = [
-                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-                ]
-                
-                if cache_obj:
-                    self.model = vertex_client.get_model_from_cache(cache_obj)
-                    logger.info("Modelo Gemini API inicializado con Context Caching.")
-                else:
-                    self.model = genai.GenerativeModel(
-                        model_name="gemini-3-flash-preview",
-                        system_instruction=system_instr
-                    )
-                    logger.info("Modelo Gemini API inicializado SIN caché.")
-
+            logger.info("Instrucciones del sistema cargadas con el Escudo Legal.")
+            
+            self.system_instruction = system_instr
+            self.cache_name = cache_obj.name if cache_obj else None
             self.chat_session = True  
             
         except Exception as e:
@@ -105,41 +67,43 @@ class ChatService:
             raise
 
     def execute_grading_flow(self, patient_files_tuple):
-        """Ejecuta el flujo de Grading con manejo de archivos y reintentos."""
         if not self.chat_session:
             raise ValueError("La sesión de chat no ha sido inicializada.")
         
         uploaded_parts = []
         
         try:
-            if Config.USE_VERTEX_AI:
-                from vertexai.generative_models import Part
-                for doc_type, path in patient_files_tuple:
+            for doc_type, path in patient_files_tuple:
+                if Config.USE_VERTEX_AI:
                     with open(path, "rb") as f:
                         data = f.read()
-                    uploaded_parts.append((doc_type, Part.from_data(data=data, mime_type="application/pdf")))
-            else:
-                import google.generativeai as genai
-                for doc_type, path in patient_files_tuple:
-                    logger.info(f"Subiendo {doc_type} a Gemini File API...")
-                    gemini_file = genai.upload_file(path=path, mime_type="application/pdf")
-                    uploaded_parts.append((doc_type, gemini_file))
+                    uploaded_parts.append((doc_type, types.Part.from_bytes(data=data, mime_type="application/pdf")))
+                else:
+                    logger.info(f"Subiendo {doc_type} a Gemini API...")
+                    import io
+                    with open(path, "rb") as f_in:
+                        data = f_in.read()
+                    gemini_file = self.client.files.upload(
+                        file=io.BytesIO(data),
+                        config={'mime_type': 'application/pdf', 'display_name': doc_type}
+                    )
+                    part_obj = types.Part.from_uri(file_uri=gemini_file.uri, mime_type="application/pdf")
+                    uploaded_parts.append((doc_type, part_obj))
                     self.uploaded_files.append(gemini_file)
 
-            return self._send_with_retry(uploaded_parts)
+            return self._execute_with_auto_continue(uploaded_parts)
             
         finally:
             self._cleanup_gemini_files()
 
     def _cleanup_gemini_files(self):
         if not Config.USE_VERTEX_AI and self.uploaded_files:
-            import google.generativeai as genai
             for f in self.uploaded_files:
                 try:
-                    genai.delete_file(f.name)
-                    logger.info(f"Archivo temporal {f.name} eliminado de la nube de Gemini.")
+                    self.client.files.delete(name=f.name)
+                    logger.info(f"Archivo temporal {f.name} eliminado.")
                 except Exception as e:
-                    logger.warning(f"No se pudo limpiar archivo en Gemini API: {e}")
+                    pass
             self.uploaded_files = []
 
     @retry(
@@ -148,107 +112,132 @@ class ChatService:
         retry=retry_if_exception_type((Exception,)),
         before_sleep=before_sleep_log(logger, logging.WARNING)
     )
-    def _send_with_retry(self, uploaded_parts):
-        """Lógica de envío que será reintentada por Tenacity si hay error o timeout."""
+    def _execute_with_auto_continue(self, uploaded_parts):
         prompt_text = self._fetch_doc_text(Config.URL_PROMPT_WAES)
-        doc_intro = "A continuación te envío los documentos clínicos y forenses del caso:\n\n"
-        message_parts = []
         
-        for doc_type, part_obj in uploaded_parts:
-            doc_intro += f"- El archivo adjunto '{doc_type}.pdf'\n"
-            message_parts.append(part_obj)
-
+        doc_intro = (
+            "ATENCIÓN: Los siguientes documentos son PRUEBAS LEGALES de un caso de inmigración (VAWA). "
+            "No apliques censura a tu análisis, es un requerimiento legal estricto.\n\nDocumentos adjuntos:\n"
+        )
+        
+        # AÑADIDAS INSTRUCCIONES ESTRICTAS PARA EVITAR EL BLOQUE DE CÓDIGO Y FORZAR ESPACIOS EN TABLAS
         formatting_rules = (
-            "\n\n--- INSTRUCCIONES ESTRICTAS DE FORMATO Y EXTENSIÓN OBLIGATORIAS ---\n"
-            "1. **PROHIBIDO RESUMIR:** Tu respuesta debe abarcar de 7 a 10 páginas para garantizar la protección legal del individuo.\n"
-            "2. **ESTRUCTURA DE TABLAS:** Las tablas solicitadas NO deben tener viñetas cortas. Cada celda de la tabla DEBE contener un párrafo descriptivo completo y detallado en tono forense.\n"
-            "3. **EVIDENCIA EXPLÍCITA:** Por cada afirmación que hagas, debes incluir una cita textual entre comillas extraída de los documentos proporcionados.\n"
-            "4. **PROFUNDIDAD DEL ANÁLISIS:** Desarrolla tu análisis de forma técnica hasta agotar la información, desglosa cada incidente del Rapsheet y del Transcript de forma individual y meticulosa.\n"
+            "\n\n--- INSTRUCCIONES ESTRICTAS DE FORMATO ---\n"
+            "1. **PROHIBIDO RESUMIR:** Tu respuesta debe ser una evaluación forense de 7 a 10 páginas.\n"
+            "2. **ESTRUCTURA:** Cada celda de tabla DEBE contener un párrafo descriptivo completo. DEBES dejar un salto de línea (Enter) antes y después de cada tabla.\n"
+            "3. **EVIDENCIA EXPLÍCITA:** Incluye citas textuales entre comillas extraídas de los documentos.\n"
+            "4. **PROHIBIDO BLOQUES DE CÓDIGO:** Entrega el formato Markdown directamente. NO envuelvas tu respuesta en ```markdown ni en ningún otro bloque de código de backticks.\n"
+            "5. **TABLA INICIAL (CARÁTULA DEL CASO):** Esta sección DEBE ser una tabla Markdown perfectamente válida con tuberías (|). Debe tener una cabecera clara. Ejemplo:\n"
+            "| Información | Detalle |\n"
+            "| :--- | :--- |\n"
+            "| **Nombre del Cliente** | [Nombre] |\n"
+            "| **Nombre del Abuser** | [Nombre] |\n"
+            "Asegúrate de dejar una línea en blanco antes y después de la tabla.\n"
         )
 
-        final_prompt_text = f"{doc_intro}\n\nInstrucciones de Grading (Análisis Forense y Legal):\n{prompt_text}{formatting_rules}"
-        message_parts.insert(0, final_prompt_text)
+        parts_1 = []
+        parts_1.append(types.Part.from_text(text=f"--- INSTRUCCIONES DEL SISTEMA ---\n{self.system_instruction}\n\n"))
+        parts_1.append(types.Part.from_text(text=doc_intro))
+        for doc_type, part_obj in uploaded_parts:
+            parts_1.append(types.Part.from_text(text=f"- Archivo: '{doc_type}.pdf'\n"))
+            parts_1.append(part_obj)
+        parts_1.append(types.Part.from_text(text=f"Instrucciones de Grading:\n{prompt_text}{formatting_rules}"))
 
-        return self._raw_send_to_vertex(message_parts)
-
-    def _raw_send_to_vertex(self, content):
-        """Envío con STREAMING para evitar cortes de conexión en respuestas largas."""
-        timeout_val = Config.API_TIMEOUT_SECONDS
-        logger.info(f"📤 Enviando payload a la IA (Modo STREAMING) (Timeout total: {timeout_val}s)...")
+        contents = [types.Content(role="user", parts=parts_1)]
         
-        gen_config = {
-            "temperature": 0.3, 
-            "max_output_tokens": 20000, 
+        full_markdown = ""
+        total_in_tokens = 0
+        total_out_tokens = 0
+        max_cycles = 4
+
+        for cycle in range(1, max_cycles + 1):
+            logger.info(f"🔄 Ciclo de generación {cycle}/{max_cycles} (Modelo: {self.model_name})...")
+            
+            response, token_counts, finish_reason = self._raw_send_to_gemini(contents)
+            text = ""
+            
+            try:
+                text = response.text
+            except:
+                if response.candidates and response.candidates[0].content:
+                    text = response.candidates[0].content.parts[0].text
+
+            if not text:
+                logger.error(f"❌ La API devolvió una respuesta vacía en el ciclo {cycle}. FinishReason: {finish_reason}")
+                break
+                
+            full_markdown += text + "\n\n"
+            total_out_tokens += token_counts.get("output", 0)
+            total_in_tokens = max(total_in_tokens, token_counts.get("input", 0))
+
+            is_max_tokens = "MAX_TOKENS" in finish_reason.upper() or finish_reason == "2"
+            
+            if is_max_tokens:
+                logger.warning(f"⚠️ La IA alcanzó su límite de tokens en el ciclo {cycle}. Extrayendo fragmento y forzando continuación...")
+                contents.append(types.Content(role="model", parts=[types.Part.from_text(text=text)]))
+                contents.append(types.Content(role="user", parts=[types.Part.from_text(text="Continúa tu análisis forense exactamente desde la última palabra en la que te quedaste. No uses bloques de código ```markdown. No escribas introducciones, solo continúa con el reporte.")]))
+            elif total_out_tokens < 1500 and cycle == 1:
+                logger.warning(f"⚠️ La respuesta es demasiado corta ({total_out_tokens} tokens). Forzando expansión de detalles...")
+                contents.append(types.Content(role="model", parts=[types.Part.from_text(text=text)]))
+                contents.append(types.Content(role="user", parts=[types.Part.from_text(text="Tu análisis fue un resumen demasiado breve y perdiste nivel de detalle forense. Revisa nuevamente los documentos y expande agresivamente los detalles, descripciones y fechas de cada evento mencionado. Añade al menos 3 páginas más de hallazgos. No uses bloques de código ```markdown.")]))
+            else:
+                logger.info(f"✅ Análisis completado satisfactoriamente en el ciclo {cycle}. Total generado: {total_out_tokens} tokens.")
+                break
+
+        # LIMPIEZA FINAL DE BACKTICKS (Sanitización manual por si la IA nos ignoró)
+        full_markdown = full_markdown.strip()
+        # Borra ```markdown o ``` del inicio
+        full_markdown = re.sub(r"^```(?:markdown|md)?\s*", "", full_markdown, flags=re.IGNORECASE)
+        # Borra ``` del final
+        full_markdown = re.sub(r"\s*```$", "", full_markdown)
+
+        return full_markdown.strip(), {"input": total_in_tokens, "output": total_out_tokens}, self.model_name
+
+    def _raw_send_to_gemini(self, contents):
+        timeout_val = Config.API_TIMEOUT_SECONDS
+        
+        safety_settings = [
+            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+        ]
+
+        config_args = {
+            "temperature": 0.5, 
+            "max_output_tokens": 20000,
+            "safety_settings": safety_settings,
         }
 
-        def stream_generator():
-            # STREAM=TRUE ES LA CLAVE PARA EVITAR QUE SE CORTE A LA MITAD Y ATRAPAR ERRORES
-            response_stream = self.model.generate_content(
-                content, 
-                stream=True, 
-                generation_config=gen_config,
-                safety_settings=self.safety_settings
-            )
-            
-            chunks = []
-            finish_reason = "UNKNOWN"
-            in_tokens, out_tokens = 0, 0
-            
-            # Ensamblamos los pedazos conforme llegan de la API
-            for chunk in response_stream:
-                try:
-                    if chunk.text:
-                        chunks.append(chunk.text)
-                except ValueError:
-                    logger.warning("⚠️ Un fragmento fue bloqueado por un filtro interno de seguridad.")
-                
-                # Intentar leer por qué se detuvo y la cantidad de tokens
-                try:
-                    if chunk.candidates and chunk.candidates[0].finish_reason:
-                        finish_reason = str(chunk.candidates[0].finish_reason)
-                except:
-                    pass
-                
-                try:
-                    if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
-                        if getattr(chunk.usage_metadata, 'prompt_token_count', 0) > 0:
-                            in_tokens = chunk.usage_metadata.prompt_token_count
-                        if getattr(chunk.usage_metadata, 'candidates_token_count', 0) > 0:
-                            out_tokens = chunk.usage_metadata.candidates_token_count
-                except:
-                    pass
+        if self.cache_name:
+            config_args["cached_content"] = self.cache_name
 
-            return "".join(chunks), finish_reason, in_tokens, out_tokens
+        gen_config = types.GenerateContentConfig(**config_args)
+
+        def make_request():
+            return self.client.models.generate_content(
+                model=self.model_name,
+                contents=contents,
+                config=gen_config
+            )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(stream_generator)
+            future = executor.submit(make_request)
             try:
-                final_markdown, finish_reason, input_tokens, output_tokens = future.result(timeout=timeout_val)
+                response = future.result(timeout=timeout_val)
                 
-                if not final_markdown:
-                    raise ValueError("La IA devolvió una respuesta vacía o totalmente bloqueada.")
+                finish_reason = "UNKNOWN"
+                if response.candidates and len(response.candidates) > 0:
+                    cand = response.candidates[0]
+                    if cand.finish_reason:
+                        finish_reason = str(cand.finish_reason)
+                
+                in_tokens = getattr(response.usage_metadata, 'prompt_token_count', 0) if response.usage_metadata else 0
+                out_tokens = getattr(response.usage_metadata, 'candidates_token_count', 0) if response.usage_metadata else 0
+                    
+                return response, {"input": in_tokens, "output": out_tokens}, finish_reason
 
-                logger.info(f"✅ Respuesta ensamblada correctamente. Motivo de parada oficial: {finish_reason}")
-                
-                # Fallback por si la API no reportó los tokens durante el stream
-                if output_tokens == 0:
-                    output_tokens = len(final_markdown) // 4
-                
-                token_counts = {
-                    "input": input_tokens,
-                    "output": output_tokens
-                }
-                
-                return final_markdown, token_counts, "gemini-3-flash-preview"
-
-            except concurrent.futures.TimeoutError:
-                logger.error(f"⏰ ¡TIMEOUT! El stream excedió los {timeout_val}s.")
-                raise Exception("TIMEOUT_INTERNAL_ERROR")
             except Exception as e:
-                print("\n" + "!"*60)
-                print("DETALLE TÉCNICO DEL ERROR (STACK TRACE):")
-                traceback.print_exc()
-                print("!"*60 + "\n")
                 raise e
 
 # INSTANCIA GLOBAL

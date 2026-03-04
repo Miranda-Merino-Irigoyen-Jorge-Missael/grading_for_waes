@@ -1,10 +1,11 @@
 import os
-# Soluciona problemas de DNS y red en Windows con gRPC
-os.environ.setdefault("GRPC_DNS_RESOLVER", "native")
-
 import logging
 import datetime
+import tempfile
+import shutil
 from src.config import Config
+from google import genai
+from google.genai import types
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -13,108 +14,102 @@ from tenacity import (
     before_sleep_log
 )
 
+# Soluciona problemas de DNS y red en Windows con gRPC
+os.environ.setdefault("GRPC_DNS_RESOLVER", "native")
+
 logger = logging.getLogger(__name__)
 
 class AIClientWrapper:
     def __init__(self):
         self.use_vertex = Config.USE_VERTEX_AI
-        self.model_name = "gemini-2.5-flash" # Respetando tu indicación del modelo
+        # CAMBIO VITAL: Unificamos a gemini-2.5-pro para que coincida con chat_service.py
+        self.model_name = "gemini-2.5-pro" 
         
+        # El nuevo SDK unifica la inicialización
         if self.use_vertex:
-            self._init_vertex()
+            self.client = genai.Client(
+                vertexai=True,
+                project=Config.PROJECT_ID,
+                location=Config.LOCATION
+            )
+            logger.info(f"Google GenAI Client (Vertex AI) inicializado en {Config.PROJECT_ID}.")
         else:
-            self._init_genai()
-
-    def _init_vertex(self):
-        import vertexai
-        try:
-            vertexai.init(project=Config.PROJECT_ID, location=Config.LOCATION)
-            logger.info(f"Vertex AI inicializado en {Config.PROJECT_ID} ({Config.LOCATION})")
-        except Exception as e:
-            logger.error(f"Error inicializando Vertex AI: {e}")
-            raise
-
-    def _init_genai(self):
-        import google.generativeai as genai
-        try:
-            genai.configure(api_key=Config.GEMINI_API_KEY)
-            logger.info("Gemini API Directa inicializada correctamente.")
-        except Exception as e:
-            logger.error(f"Error inicializando Gemini API: {e}")
-            raise
+            self.client = genai.Client(api_key=Config.GEMINI_API_KEY)
+            logger.info("Google GenAI Client (Gemini API Directa) inicializado.")
 
     @retry(
-        stop=stop_after_attempt(Config.MAX_RETRIES),
-        wait=wait_exponential(multiplier=1, min=Config.RETRY_MIN_WAIT, max=Config.RETRY_MAX_WAIT),
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=2, min=5, max=60),
         retry=retry_if_exception_type((Exception,)),
         before_sleep=before_sleep_log(logger, logging.WARNING)
     )
-    def create_cache(self, cache_name, file_paths, system_instruction, ttl_hours=12):
-        logger.info(f"Creando caché '{cache_name}' con {len(file_paths)} documentos. Modo Vertex: {self.use_vertex}")
+    def _upload_file_with_retry(self, path):
+        """Sube el archivo a Gemini usando un nombre seguro para evadir el error Unicode de Windows."""
+        logger.info(f"Subiendo archivo a Gemini API: {path}")
         
-        if self.use_vertex:
-            return self._create_cache_vertex(cache_name, file_paths, system_instruction, ttl_hours)
-        else:
-            return self._create_cache_genai(cache_name, file_paths, system_instruction, ttl_hours)
+        # Trampa: Crear una copia temporal con nombre puramente ASCII (evita WinError Unicode)
+        temp_dir = tempfile.mkdtemp()
+        safe_path = os.path.join(temp_dir, "temp_safe_upload.pdf")
+        shutil.copy2(path, safe_path)
+        
+        try:
+            # Subimos el archivo con el nombre seguro, pero le decimos a Gemini su nombre original
+            uploaded_file = self.client.files.upload(
+                file=safe_path,
+                config=types.UploadFileConfig(
+                    display_name=os.path.basename(path) # Aquí sí acepta acentos sin explotar
+                )
+            )
+            return uploaded_file
+        finally:
+            # Limpiamos el rastro
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _create_cache_vertex(self, cache_name, file_paths, system_instruction, ttl_hours):
-        from vertexai.preview.caching import CachedContent
-        from vertexai.generative_models import Part
+    def create_cache(self, cache_name, file_paths, system_instruction, ttl_hours=12):
+        logger.info(f"Creando caché '{cache_name}' con {len(file_paths)} documentos. Modo Vertex: {self.use_vertex}. Modelo: {self.model_name}")
         
         parts = []
-        for path in file_paths:
-            try:
-                with open(path, "rb") as f:
-                    data = f.read()
-                parts.append(Part.from_data(data=data, mime_type="application/pdf"))
-            except Exception as e:
-                logger.error(f"No se pudo leer el archivo {path}: {e}")
-                raise
-
-        cache = CachedContent.create(
-            model_name=self.model_name,
-            display_name=cache_name,
-            system_instruction=system_instruction,
-            contents=parts,
-            ttl=datetime.timedelta(hours=ttl_hours)
-        )
-        logger.info(f"Caché Vertex creado exitosamente. Expira: {cache.expire_time}")
-        return cache
-
-    def _create_cache_genai(self, cache_name, file_paths, system_instruction, ttl_hours):
-        import google.generativeai as genai
-        
         uploaded_files = []
-        for path in file_paths:
-            try:
-                logger.info(f"Subiendo archivo a Gemini File API para caché: {path}")
-                uploaded_file = genai.upload_file(path=path, mime_type="application/pdf")
-                uploaded_files.append(uploaded_file)
-            except Exception as e:
-                logger.error(f"No se pudo subir {path} a Gemini File API: {e}")
-                raise
         
-        cache = genai.caching.CachedContent.create(
-            model=f"models/{self.model_name}",
-            display_name=cache_name,
-            system_instruction=system_instruction,
-            contents=uploaded_files,
-            ttl=datetime.timedelta(hours=ttl_hours)
-        )
-        logger.info(f"Caché Gemini API creado exitosamente. Expira: {cache.expire_time}")
-        return cache
-
-    def get_model_from_cache(self, cache_obj):
         try:
-            if self.use_vertex:
-                from vertexai.generative_models import GenerativeModel
-                return GenerativeModel.from_cached_content(cached_content=cache_obj)
-            else:
-                import google.generativeai as genai
-                return genai.GenerativeModel.from_cached_content(cached_content=cache_obj)
+            for path in file_paths:
+                if self.use_vertex:
+                    # En Vertex podemos mandar los bytes directamente en la petición
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    parts.append(types.Part.from_bytes(data=data, mime_type="application/pdf"))
+                    logger.info(f"✅ Archivo leído localmente para Vertex: {os.path.basename(path)}")
+                else:
+                    # En la API directa requerimos subir el archivo
+                    uploaded_file = self._upload_file_with_retry(path)
+                    uploaded_files.append(uploaded_file)
+                    parts.append(types.Part.from_uri(file_uri=uploaded_file.uri, mime_type="application/pdf"))
+                    logger.info(f"✅ Subida exitosa confirmada: {os.path.basename(path)}")
+            
+            # Una vez preparados los parts, creamos el caché usando el nuevo SDK unificado
+            logger.info("Generando caché en la IA...")
+            cache = self.client.caches.create(
+                model=self.model_name,
+                config=types.CreateCachedContentConfig(
+                    contents=[types.Content(role="user", parts=parts)],
+                    system_instruction=system_instruction,
+                    display_name=cache_name,
+                    ttl=f"{ttl_hours * 3600}s"
+                )
+            )
+            logger.info(f"🎉 Caché creado exitosamente. ID: {cache.name}")
+            return cache
+
         except Exception as e:
-            logger.error(f"Error instanciando modelo desde caché: {e}")
+            logger.error(f"Error generando el caché: {e}")
+            # Limpieza en caso de fallo crítico
+            if not self.use_vertex:
+                for f in uploaded_files:
+                    try:
+                        self.client.files.delete(name=f.name)
+                    except:
+                        pass
             raise
 
-# Instanciamos la clase con el mismo nombre de variable para no romper las importaciones en otros archivos
+# Instanciamos la clase globalmente
 vertex_client = AIClientWrapper()
